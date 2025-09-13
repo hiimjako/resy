@@ -1,15 +1,15 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::{Client, Error as S3Error, config::Credentials};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug)]
 struct S3Object {
-    bucket: String,
+    key: String,
     etag: String,
     size: i64,
     last_modified: DateTime<Utc>,
@@ -24,7 +24,7 @@ struct CompactS3Object {
 
 #[derive(Serialize, Deserialize)]
 struct CompactBucketState {
-    objects: HashMap<String, CompactS3Object>, // Key is the S3 object key
+    objects: HashMap<String, CompactS3Object>, // HashMap key here is the S3 object key
     timestamp: i64,
 }
 
@@ -123,7 +123,7 @@ impl S3 {
                         (obj.key(), obj.e_tag(), obj.size(), obj.last_modified())
                     {
                         let s3_object = S3Object {
-                            bucket: key.to_string(),
+                            key: key.to_string(),
                             etag: etag.to_string(),
                             size,
                             last_modified: DateTime::from_timestamp(
@@ -161,21 +161,147 @@ impl S3 {
     pub async fn stream_diff_and_update<F>(
         &self,
         db_path: &str,
-        _change_handler: F,
+        mut change_handler: F,
     ) -> Result<DiffStats, Box<dyn std::error::Error>>
     where
         F: FnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        let _conn = self.create_state_db(db_path).await?;
-
-        Ok(DiffStats {
+        let mut conn = self.create_state_db(db_path).await?;
+        let mut stats = DiffStats {
             added: 0,
             modified: 0,
             deleted: 0,
             unchanged: 0,
-        })
-    }
+        };
+        let mut seen_keys = HashSet::new();
 
+        let tx = conn.unchecked_transaction()?;
+
+        let mut select_stmt =
+            tx.prepare("SELECT etag, size, last_modified FROM object_state WHERE key = ?1")?;
+
+        let mut update_stmt = tx.prepare(
+            "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)"
+        )?;
+
+        self.stream_objects(|current_obj| {
+            seen_keys.insert(current_obj.key.clone());
+
+            let previous_state = select_stmt
+                .query_row([&current_obj.key], |row| {
+                    Ok(CompactS3Object {
+                        etag: row.get(0)?,
+                        size: row.get(1)?,
+                        last_modified: row.get(2)?,
+                    })
+                })
+                .optional()?;
+
+            let change = match previous_state {
+                None => {
+                    stats.added += 1;
+                    Some(Change::Added(current_obj.clone()))
+                }
+                Some(prev_obj) => {
+                    if prev_obj.etag != current_obj.etag {
+                        stats.modified += 1;
+                        Some(Change::Modified {
+                            old: S3Object {
+                                key: current_obj.key.clone(),
+                                etag: prev_obj.etag,
+                                size: prev_obj.size as i64,
+                                last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
+                                    .unwrap_or_default()
+                                    .with_timezone(&Utc),
+                            },
+                            new: current_obj.clone(),
+                        })
+                    } else {
+                        stats.unchanged += 1;
+                        None
+                    }
+                }
+            };
+
+            update_stmt.execute(params![
+                current_obj.key,
+                current_obj.etag,
+                current_obj.size,
+                current_obj.last_modified.timestamp()
+            ])?;
+
+            if let Some(change) = change {
+                change_handler(change)?;
+            }
+
+            let total_processed = stats.added + stats.modified + stats.unchanged;
+            if total_processed % 10_000 == 0 {
+                println!(
+                    "Processed {}: {} added, {} modified, {} unchanged",
+                    total_processed, stats.added, stats.modified, stats.unchanged
+                );
+            }
+
+            Ok(())
+        })
+        .await?;
+
+        let mut deleted_stmt = tx.prepare(
+            "SELECT key, etag, size, last_modified FROM object_state WHERE key NOT IN (SELECT value FROM json_each(?))"
+        )?;
+
+        let seen_keys_json = serde_json::to_string(&seen_keys.iter().collect::<Vec<_>>())?;
+
+        // @todo: optimize this. Current approach loads all previous objects into memory.
+        let mut all_previous_stmt =
+            tx.prepare("SELECT key, etag, size, last_modified FROM object_state")?;
+        let previous_objects: Vec<(String, CompactS3Object)> = all_previous_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CompactS3Object {
+                        etag: row.get(1)?,
+                        size: row.get(2)?,
+                        last_modified: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut delete_obj_stmt = tx.prepare("DELETE FROM object_state WHERE key = ?1")?;
+
+        for (key, prev_obj) in previous_objects {
+            if !seen_keys.contains(&key) {
+                stats.deleted += 1;
+
+                let deleted_obj = S3Object {
+                    key: key.clone(),
+                    etag: prev_obj.etag,
+                    size: prev_obj.size as i64,
+                    last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
+                        .unwrap_or_default()
+                        .with_timezone(&Utc),
+                };
+
+                change_handler(Change::Deleted(deleted_obj))?;
+                delete_obj_stmt.execute([&key])?;
+            }
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_updated', ?1)",
+            params![Utc::now().timestamp()],
+        )?;
+
+        tx.commit()?;
+
+        println!(
+            "Diff completed: {} added, {} modified, {} deleted, {} unchanged",
+            stats.added, stats.modified, stats.deleted, stats.unchanged
+        );
+
+        Ok(stats)
+    }
     async fn create_state_db(&self, db_path: &str) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
 
@@ -249,7 +375,7 @@ impl S3 {
         let mut current_objects: HashMap<String, S3Object> = HashMap::new();
 
         self.stream_objects(|obj| {
-            current_objects.insert(obj.bucket.clone(), obj);
+            current_objects.insert(obj.key.clone(), obj);
             Ok(())
         })
         .await?;
@@ -296,7 +422,7 @@ impl S3 {
 
     fn compact_to_s3_object(&self, key: &str, compact: &CompactS3Object) -> S3Object {
         S3Object {
-            bucket: key.to_string(),
+            key: key.to_string(),
             etag: compact.etag.clone(),
             size: compact.size as i64,
             last_modified: DateTime::from_timestamp(compact.last_modified, 0)
