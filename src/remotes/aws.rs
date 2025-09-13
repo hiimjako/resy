@@ -158,35 +158,72 @@ impl S3 {
         Ok(())
     }
 
+    async fn create_state_db(&self, db_path: &str) -> Result<Connection, rusqlite::Error> {
+        let conn = Connection::open(db_path)?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_state (
+            key TEXT PRIMARY KEY,
+            etag TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            last_modified INTEGER NOT NULL
+        )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_etag ON object_state(etag)",
+            [],
+        )?;
+
+        Ok(conn)
+    }
+
     pub async fn stream_diff_and_update<F>(
         &self,
         db_path: &str,
         mut change_handler: F,
-    ) -> Result<DiffStats, Box<dyn std::error::Error>>
+    ) -> Result<DiffStats, Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        let mut conn = self.create_state_db(db_path).await?;
+        let conn = self.create_state_db(db_path).await?;
         let mut stats = DiffStats {
             added: 0,
             modified: 0,
             deleted: 0,
             unchanged: 0,
         };
-        let mut seen_keys = HashSet::new();
 
         let tx = conn.unchecked_transaction()?;
+
+        tx.execute(
+            "ALTER TABLE object_state ADD COLUMN temp_seen INTEGER DEFAULT 0",
+            [],
+        )
+        .ok();
+
+        tx.execute("UPDATE object_state SET temp_seen = 0", [])?;
 
         let mut select_stmt =
             tx.prepare("SELECT etag, size, last_modified FROM object_state WHERE key = ?1")?;
 
         let mut update_stmt = tx.prepare(
-            "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)"
-        )?;
+        "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified, temp_seen) VALUES (?1, ?2, ?3, ?4, 1)"
+    )?;
+
+        let mut mark_seen_stmt =
+            tx.prepare("UPDATE object_state SET temp_seen = 1 WHERE key = ?1")?;
 
         self.stream_objects(|current_obj| {
-            seen_keys.insert(current_obj.key.clone());
-
             let previous_state = select_stmt
                 .query_row([&current_obj.key], |row| {
                     Ok(CompactS3Object {
@@ -200,11 +237,26 @@ impl S3 {
             let change = match previous_state {
                 None => {
                     stats.added += 1;
+                    update_stmt.execute(params![
+                        current_obj.key,
+                        current_obj.etag,
+                        current_obj.size,
+                        current_obj.last_modified.timestamp()
+                    ])?;
                     Some(Change::Added(current_obj.clone()))
                 }
                 Some(prev_obj) => {
+                    mark_seen_stmt.execute([&current_obj.key])?;
+
                     if prev_obj.etag != current_obj.etag {
+                        // Object modified - update it
                         stats.modified += 1;
+                        update_stmt.execute(params![
+                            current_obj.key,
+                            current_obj.etag,
+                            current_obj.size,
+                            current_obj.last_modified.timestamp()
+                        ])?;
                         Some(Change::Modified {
                             old: S3Object {
                                 key: current_obj.key.clone(),
@@ -223,13 +275,6 @@ impl S3 {
                 }
             };
 
-            update_stmt.execute(params![
-                current_obj.key,
-                current_obj.etag,
-                current_obj.size,
-                current_obj.last_modified.timestamp()
-            ])?;
-
             if let Some(change) = change {
                 change_handler(change)?;
             }
@@ -247,15 +292,10 @@ impl S3 {
         .await?;
 
         let mut deleted_stmt = tx.prepare(
-            "SELECT key, etag, size, last_modified FROM object_state WHERE key NOT IN (SELECT value FROM json_each(?))"
+            "SELECT key, etag, size, last_modified FROM object_state WHERE temp_seen = 0",
         )?;
 
-        let seen_keys_json = serde_json::to_string(&seen_keys.iter().collect::<Vec<_>>())?;
-
-        // @todo: optimize this. Current approach loads all previous objects into memory.
-        let mut all_previous_stmt =
-            tx.prepare("SELECT key, etag, size, last_modified FROM object_state")?;
-        let previous_objects: Vec<(String, CompactS3Object)> = all_previous_stmt
+        let deleted_rows: Vec<_> = deleted_stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -269,24 +309,34 @@ impl S3 {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut delete_obj_stmt = tx.prepare("DELETE FROM object_state WHERE key = ?1")?;
+        for deleted_row in deleted_rows {
+            let (key, prev_obj) = deleted_row;
+            stats.deleted += 1;
 
-        for (key, prev_obj) in previous_objects {
-            if !seen_keys.contains(&key) {
-                stats.deleted += 1;
+            let deleted_obj = S3Object {
+                key: key.clone(),
+                etag: prev_obj.etag,
+                size: prev_obj.size as i64,
+                last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&Utc),
+            };
 
-                let deleted_obj = S3Object {
-                    key: key.clone(),
-                    etag: prev_obj.etag,
-                    size: prev_obj.size as i64,
-                    last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
-                        .unwrap_or_default()
-                        .with_timezone(&Utc),
-                };
-
-                change_handler(Change::Deleted(deleted_obj))?;
-                delete_obj_stmt.execute([&key])?;
-            }
+            change_handler(Change::Deleted(deleted_obj))?;
+            delete_obj_stmt.execute([&key])?;
         }
+
+        // Clean up the temporary column (for next run)
+        // SQLite doesn't support DROP COLUMN before version 3.35.0
+        // So let's make sure we use version >= 3.35.0 in production
+        tx.execute("ALTER TABLE object_state DROP COLUMN temp_seen", [])?;
+
+        // Drop statements to release borrows on tx. It took hours to figure this out so please Tommaso let me know if there's a better way :D
+        drop(select_stmt);
+        drop(update_stmt);
+        drop(mark_seen_stmt);
+        drop(deleted_stmt);
+        drop(delete_obj_stmt);
 
         tx.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_updated', ?1)",
@@ -301,36 +351,6 @@ impl S3 {
         );
 
         Ok(stats)
-    }
-    async fn create_state_db(&self, db_path: &str) -> Result<Connection, rusqlite::Error> {
-        let conn = Connection::open(db_path)?;
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS object_state (
-            key TEXT PRIMARY KEY,
-            etag TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            last_modified TEXT NOT NULL
-        )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-          )",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS
-          index_etag ON object_state (etag)
-          ",
-            [],
-        )?;
-
-        Ok(conn)
     }
 
     async fn save_state_to_db(
