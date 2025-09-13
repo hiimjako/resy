@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug)]
-struct S3Object {
+pub struct S3Object {
     key: String,
     etag: String,
     size: i64,
@@ -29,18 +29,13 @@ struct CompactBucketState {
     timestamp: i64,
 }
 
-struct BucketState {
-    objects: HashMap<String, S3Object>,
-    timestamp: DateTime<Utc>,
-}
-
-enum Change {
+pub enum Change {
     Added(S3Object),
     Modified { old: S3Object, new: S3Object },
     Deleted(S3Object),
 }
 
-struct DiffStats {
+pub struct DiffStats {
     added: u64,
     modified: u64,
     deleted: u64,
@@ -48,7 +43,7 @@ struct DiffStats {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
-struct S3 {
+pub struct S3 {
     #[zeroize(skip)]
     bucket: String,
     #[zeroize(skip)]
