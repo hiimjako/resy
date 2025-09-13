@@ -1,10 +1,11 @@
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_s3::{Client, Error as S3Error, config::Credentials};
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{Client, Error as S3Error};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Result, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug)]
@@ -329,7 +330,14 @@ impl S3 {
         // Clean up the temporary column (for next run)
         // SQLite doesn't support DROP COLUMN before version 3.35.0
         // So let's make sure we use version >= 3.35.0 in production
-        tx.execute("ALTER TABLE object_state DROP COLUMN temp_seen", [])?;
+        tx.execute(
+            "ALTER TABLE object_state DROP COLUMN IF EXISTS temp_seen",
+            [],
+        )
+        .or_else(|_| {
+            println!("Warning: Could not drop temp_seen column (older SQLite version)");
+            Ok::<_, rusqlite::Error>(0) // @todo: is it ok to return a success here?
+        })?;
 
         // Drop statements to release borrows on tx. It took hours to figure this out so please Tommaso let me know if there's a better way :D
         drop(select_stmt);

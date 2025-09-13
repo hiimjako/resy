@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 aws-config = "1.8.6"
+aws-credential-types = "1.2.6"
 aws-sdk-s3 = "1.106.0"
 chrono = { version = "0.4.42", features = ["serde"] }
 lz4_flex = "0.11.5"
