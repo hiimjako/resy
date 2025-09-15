@@ -17,7 +17,7 @@ pub struct S3Object {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct CompactS3Object {
+pub struct CompactS3Object {
     etag: String,
     size: u64,
     last_modified: i64,
@@ -379,93 +379,6 @@ impl S3 {
         );
 
         Ok(stats)
-    }
-
-    async fn save_state_to_db(
-        &self,
-        conn: &Connection,
-        objects: &HashMap<String, S3Object>,
-    ) -> Result<(), rusqlite::Error> {
-        let tx = conn.unchecked_transaction()?;
-
-        tx.execute("DELETE FROM object_state", [])?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-
-            for (key, obj) in objects {
-                stmt.execute(params![
-                    key,
-                    obj.etag,
-                    obj.size,
-                    obj.last_modified.timestamp()
-                ])?;
-            }
-        }
-
-        tx.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_updated', ?1)",
-            params![Utc::now().timestamp()],
-        )?;
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
-    async fn compute_diff_from_db(
-        &self,
-        conn: &Connection,
-    ) -> Result<Vec<Change>, Box<dyn std::error::Error>> {
-        let mut changes: Vec<Change> = Vec::new();
-        let mut current_objects: HashMap<String, S3Object> = HashMap::new();
-
-        self.stream_objects(|obj| {
-            current_objects.insert(obj.key.clone(), obj);
-            Ok(())
-        })
-        .await?;
-
-        let mut stmt = conn.prepare("SELECT key, etag, size, last_modified FROM object_state")?;
-
-        let previous_objects: HashMap<String, CompactS3Object> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    CompactS3Object {
-                        etag: row.get(1)?,
-                        size: row.get(2)?,
-                        last_modified: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        for (key, current_obj) in &current_objects {
-            match previous_objects.get(key) {
-                None => changes.push(Change::Added(current_obj.clone())),
-                Some(prev_obj) => {
-                    if prev_obj.etag != current_obj.etag {
-                        changes.push(Change::Modified {
-                            old: self.compact_to_s3_object(key, prev_obj),
-                            new: current_obj.clone(),
-                        })
-                    }
-                }
-            }
-        }
-
-        for (key, prev_obj) in &previous_objects {
-            if !current_objects.contains_key(key) {
-                changes.push(Change::Deleted(self.compact_to_s3_object(key, prev_obj)))
-            }
-        }
-
-        println!("Computed {} changes", changes.len());
-
-        Ok(changes)
     }
 
     pub fn compact_to_s3_object(&self, key: &str, compact: &CompactS3Object) -> S3Object {
