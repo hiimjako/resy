@@ -68,8 +68,6 @@ Database transactions ensure consistency during concurrent operations, and the c
 
 ## How it works
 
-![Resy S3 Flow](/misc/flow.svg)
-
 ```mermaid
 flowchart TD
       A[Start: stream_diff_and_update] --> B[Create/Connect to SQLite DB]
