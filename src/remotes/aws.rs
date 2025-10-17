@@ -5,7 +5,6 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Result, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,12 +20,6 @@ pub struct CompactS3Object {
     etag: String,
     size: u64,
     last_modified: i64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct CompactBucketState {
-    objects: HashMap<String, CompactS3Object>, // HashMap key here is the S3 object key
-    timestamp: i64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,25 +38,25 @@ pub struct DiffStats {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct S3 {
+pub struct S3Conf {
     #[zeroize(skip)]
-    bucket: String,
+    pub bucket: String,
     #[zeroize(skip)]
-    region: String,
-    access_key_id: SecretString,
-    secret_access_key: SecretString,
+    pub region: String,
+    pub access_key_id: SecretString,
+    pub secret_access_key: SecretString,
     #[zeroize(skip)]
-    endpoint_url: Option<String>,
+    pub endpoint_url: Option<String>,
 }
 
-impl S3 {
+impl S3Conf {
     pub fn new(
         bucket: String,
         access_key_id: String,
         secret_access_key: String,
         region: String,
     ) -> Self {
-        S3 {
+        S3Conf {
             bucket,
             access_key_id: SecretString::new(access_key_id.into()),
             secret_access_key: SecretString::new(secret_access_key.into()),
@@ -79,7 +72,7 @@ impl S3 {
         region: String,
         endpoint_url: String,
     ) -> Self {
-        S3 {
+        S3Conf {
             bucket,
             access_key_id: SecretString::new(access_key_id.into()),
             secret_access_key: SecretString::new(secret_access_key.into()),
@@ -95,41 +88,71 @@ impl S3 {
     fn get_secret_access_key(&self) -> &str {
         self.secret_access_key.expose_secret()
     }
+}
 
-    pub async fn create_client(&self) -> Result<Client, S3Error> {
+pub struct S3 {
+    client: Client,
+    bucket: String,
+}
+
+impl S3 {
+    pub async fn new(conf: &S3Conf) -> Self {
+        Self::create_client(conf).await
+    }
+
+    pub fn from_client(client: Client, bucket: String) -> Self {
+        Self { client, bucket }
+    }
+
+    async fn create_client(conf: &S3Conf) -> Self {
         let credentials = Credentials::new(
-            self.get_access_key_id(),
-            self.get_secret_access_key(),
+            conf.get_access_key_id(),
+            conf.get_secret_access_key(),
             None,
             None,
             "resy",
         );
 
-        let region = Region::new(self.region.clone());
+        let region = Region::new(conf.region.clone());
 
         let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
             .region(region)
             .credentials_provider(credentials);
 
         // ideally we should only use endpoint_url for local testing. We may want to add a flag to disable it in prod.
-        if let Some(ref endpoint) = self.endpoint_url {
+        if let Some(ref endpoint) = conf.endpoint_url {
             config_builder = config_builder.endpoint_url(endpoint);
         }
 
         let config = config_builder.load().await;
-        Ok(Client::new(&config))
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config);
+
+        // only for local testing
+        if conf.endpoint_url.is_some() {
+            s3_config_builder = s3_config_builder.force_path_style(true);
+        }
+
+        let s3_config = s3_config_builder.build();
+
+        Self {
+            client: Client::from_conf(s3_config),
+            bucket: conf.bucket.clone(),
+        }
     }
 
     async fn stream_objects<F>(&self, mut processor: F) -> Result<(), S3Error>
     where
         F: FnMut(S3Object) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        let client = self.create_client().await?;
         let mut continuation_token: Option<String> = None;
         let mut total_processed = 0;
 
         loop {
-            let mut request = client.list_objects_v2().bucket(&self.bucket).max_keys(1000);
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .max_keys(1000);
 
             if let Some(token) = continuation_token.take() {
                 request = request.continuation_token(token);
@@ -179,7 +202,7 @@ impl S3 {
         Ok(())
     }
 
-    pub async fn create_state_db(&self, db_path: &str) -> Result<Connection, rusqlite::Error> {
+    pub async fn create_state_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
 
         conn.execute(
@@ -216,7 +239,7 @@ impl S3 {
     where
         F: FnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        let conn = self.create_state_db(db_path).await?;
+        let conn = Self::create_state_db(db_path).await?;
         let mut stats = DiffStats {
             added: 0,
             modified: 0,
@@ -238,8 +261,8 @@ impl S3 {
             tx.prepare("SELECT etag, size, last_modified FROM object_state WHERE key = ?1")?;
 
         let mut update_stmt = tx.prepare(
-        "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified, temp_seen) VALUES (?1, ?2, ?3, ?4, 1)"
-    )?;
+            "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified, temp_seen) VALUES (?1, ?2, ?3, ?4, 1)",
+        )?;
 
         let mut mark_seen_stmt =
             tx.prepare("UPDATE object_state SET temp_seen = 1 WHERE key = ?1")?;
@@ -301,7 +324,7 @@ impl S3 {
             }
 
             let total_processed = stats.added + stats.modified + stats.unchanged;
-            if total_processed % 10_000 == 0 {
+            if total_processed.is_multiple_of(10_000) {
                 println!(
                     "Processed {}: {} added, {} modified, {} unchanged",
                     total_processed, stats.added, stats.modified, stats.unchanged
@@ -359,7 +382,8 @@ impl S3 {
             Ok::<_, rusqlite::Error>(0) // @todo: is it ok to return a success here?
         })?;
 
-        // drop statements to release borrows on tx. It took hours to figure this out so please Tommaso let me know if there's a better way :D
+        // drop statements to release borrows on tx.
+        // It took hours to figure this out so please Tommaso let me know if there's a better way :D
         drop(select_stmt);
         drop(update_stmt);
         drop(mark_seen_stmt);
@@ -381,7 +405,7 @@ impl S3 {
         Ok(stats)
     }
 
-    pub fn compact_to_s3_object(&self, key: &str, compact: &CompactS3Object) -> S3Object {
+    pub fn compact_to_s3_object(key: &str, compact: &CompactS3Object) -> S3Object {
         S3Object {
             key: key.to_string(),
             etag: compact.etag.clone(),
@@ -395,10 +419,11 @@ impl S3 {
 
 #[cfg(test)]
 mod tests {
+    use crate::remotes::aws;
+
     use super::*;
     use chrono::TimeZone;
     use tempfile::NamedTempFile;
-    use tokio_test;
 
     fn create_test_s3_object(key: &str, etag: &str, size: i64, timestamp: i64) -> S3Object {
         S3Object {
@@ -409,8 +434,8 @@ mod tests {
         }
     }
 
-    fn create_test_s3() -> S3 {
-        S3::new(
+    fn create_test_s3_conf() -> S3Conf {
+        S3Conf::new(
             "test-bucket".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
@@ -430,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_s3_struct_creation() {
-        let s3 = create_test_s3();
+        let s3 = create_test_s3_conf();
 
         assert_eq!(s3.bucket, "test-bucket");
         assert_eq!(s3.region, "us-west-2");
@@ -482,17 +507,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_state_db() {
-        let s3 = create_test_s3();
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = s3.create_state_db(db_path).await.unwrap();
+        let conn = aws::S3::create_state_db(db_path).await.unwrap();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .unwrap();
         let tables: Vec<String> = stmt
-            .query_map([], |row| Ok(row.get::<_, String>(0)?))
+            .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -509,14 +533,13 @@ mod tests {
 
     #[test]
     fn test_compact_to_s3_object() {
-        let s3 = create_test_s3();
         let compact = CompactS3Object {
             etag: "etag123".to_string(),
             size: 1024,
             last_modified: 1609459200,
         };
 
-        let s3_obj = s3.compact_to_s3_object("test/file.txt", &compact);
+        let s3_obj = aws::S3::compact_to_s3_object("test/file.txt", &compact);
 
         assert_eq!(s3_obj.key, "test/file.txt");
         assert_eq!(s3_obj.etag, "etag123");
@@ -529,11 +552,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_database_operations() {
-        let s3 = create_test_s3();
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = s3.create_state_db(db_path).await.unwrap();
+        let conn = aws::S3::create_state_db(db_path).await.unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
@@ -558,11 +580,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_database_with_temp_seen_column() {
-        let s3 = create_test_s3();
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = s3.create_state_db(db_path).await.unwrap();
+        let conn = aws::S3::create_state_db(db_path).await.unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
@@ -622,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_s3_with_endpoint() {
-        let s3 = S3::new_with_endpoint(
+        let s3 = S3Conf::new_with_endpoint(
             "test-bucket".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
@@ -639,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_s3_without_endpoint() {
-        let s3 = S3::new(
+        let s3 = S3Conf::new(
             "test-bucket".to_string(),
             "test-key".to_string(),
             "test-secret".to_string(),
