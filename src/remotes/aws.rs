@@ -419,8 +419,6 @@ impl S3 {
 
 #[cfg(test)]
 mod tests {
-    use crate::remotes::aws;
-
     use super::*;
     use chrono::TimeZone;
     use tempfile::NamedTempFile;
@@ -510,7 +508,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = aws::S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).await.unwrap();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -539,7 +537,7 @@ mod tests {
             last_modified: 1609459200,
         };
 
-        let s3_obj = aws::S3::compact_to_s3_object("test/file.txt", &compact);
+        let s3_obj = S3::compact_to_s3_object("test/file.txt", &compact);
 
         assert_eq!(s3_obj.key, "test/file.txt");
         assert_eq!(s3_obj.etag, "etag123");
@@ -555,7 +553,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = aws::S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).await.unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
@@ -583,7 +581,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let conn = aws::S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).await.unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
