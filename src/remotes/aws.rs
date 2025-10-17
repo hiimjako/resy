@@ -232,14 +232,14 @@ impl S3 {
     }
 
     pub async fn stream_diff_and_update<F>(
-        &self,
+        &mut self,
         db_path: &str,
         mut change_handler: F,
     ) -> Result<DiffStats, Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
-        let conn = Self::create_state_db(db_path).await?;
+        let mut conn = Self::create_state_db(db_path).await?;
         let mut stats = DiffStats {
             added: 0,
             modified: 0,
@@ -247,7 +247,7 @@ impl S3 {
             unchanged: 0,
         };
 
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction()?;
 
         tx.execute(
             "ALTER TABLE object_state ADD COLUMN temp_seen INTEGER DEFAULT 0",
