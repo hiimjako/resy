@@ -60,7 +60,7 @@ async fn test_stream_diff_and_update() {
     assert!(found, "Bucket '{}' was not found in the list.", bucket_name);
 
     let db_file = tempfile::NamedTempFile::new().unwrap();
-    let db_path = db_file.path().to_str().unwrap();
+    let db_path = db_file.path();
 
     let mut s3 = resy::remotes::aws::S3::from_client(s3_client.clone(), bucket_name.to_string());
 

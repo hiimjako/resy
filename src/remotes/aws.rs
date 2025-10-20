@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Result, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,7 +203,7 @@ impl S3 {
         Ok(())
     }
 
-    pub async fn create_state_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
+    pub async fn create_state_db(db_path: &Path) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
 
         conn.execute(
@@ -233,7 +234,7 @@ impl S3 {
 
     pub async fn stream_diff_and_update<F>(
         &mut self,
-        db_path: &str,
+        db_path: &Path,
         mut change_handler: F,
     ) -> Result<DiffStats, Box<dyn std::error::Error + Send + Sync>>
     where
@@ -506,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_state_db() {
         let temp_file = NamedTempFile::new().unwrap();
-        let db_path = temp_file.path().to_str().unwrap();
+        let db_path = temp_file.path();
 
         let conn = S3::create_state_db(db_path).await.unwrap();
 
@@ -551,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn test_database_operations() {
         let temp_file = NamedTempFile::new().unwrap();
-        let db_path = temp_file.path().to_str().unwrap();
+        let db_path = temp_file.path();
 
         let conn = S3::create_state_db(db_path).await.unwrap();
 
@@ -579,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn test_database_with_temp_seen_column() {
         let temp_file = NamedTempFile::new().unwrap();
-        let db_path = temp_file.path().to_str().unwrap();
+        let db_path = temp_file.path();
 
         let conn = S3::create_state_db(db_path).await.unwrap();
 
