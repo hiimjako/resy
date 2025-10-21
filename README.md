@@ -7,13 +7,14 @@
 ```rust
 #[tokio::main]
   async fn main() -> Result<(), Box<dyn std::error::Error>> {
-      // Initialize S3 client
-      let s3 = S3::new(
+      let s3_conf = S3Conf::new(
           "my-bucket".to_string(),
           "AKIA...".to_string(),      // access_key_id
           "secret...".to_string(),    // secret_access_key
           "us-east-1".to_string(),    // region
-      );
+      )
+      // Initialize S3 client
+      let s3 = S3::new(s3_conf).await;
 
       // Path to store state database
       let db_path = "./bucket_state.db";
