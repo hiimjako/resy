@@ -199,7 +199,7 @@ impl S3 {
             }
         }
 
-        print!("Total processed {} objects", total_processed);
+        println!("Total processed {} objects", total_processed);
         Ok(())
     }
 
