@@ -10,9 +10,9 @@ use testcontainers::{ImageExt, core::ContainerPort};
 
 #[tokio::test]
 async fn test_stream_diff_and_update() {
-    let localstack_port = ContainerPort::Tcp(4566);
+    let localstack_port = 4566;
     let container = GenericImage::new("localstack/localstack", "s3-latest")
-        .with_exposed_port(localstack_port)
+        .with_exposed_port(ContainerPort::Tcp(localstack_port))
         .with_wait_for(WaitFor::message_on_stdout("Ready."))
         .with_env_var("SERVICES", "s3")
         .start()
@@ -21,7 +21,7 @@ async fn test_stream_diff_and_update() {
 
     let host = container.get_host().await.unwrap();
     let host_port = container
-        .get_host_port_ipv4(localstack_port.as_u16())
+        .get_host_port_ipv4(ContainerPort::Tcp(localstack_port))
         .await
         .unwrap();
     let endpoint_url = format!("http://{}:{}", host, host_port);

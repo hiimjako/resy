@@ -1,5 +1,6 @@
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
+use aws_sdk_s3::config::SharedCredentialsProvider;
 use aws_sdk_s3::{Client, Error as S3Error};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Result, params};
@@ -114,29 +115,23 @@ impl S3 {
             "resy",
         );
 
-        let region = Region::new(conf.region.clone());
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::new()
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .region(Region::new(conf.region.clone()))
+            .behavior_version(BehaviorVersion::latest());
 
-        let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
-            .region(region)
-            .credentials_provider(credentials);
-
-        // ideally we should only use endpoint_url for local testing. We may want to add a flag to disable it in prod.
-        if let Some(ref endpoint) = conf.endpoint_url {
-            config_builder = config_builder.endpoint_url(endpoint);
-        }
-
-        let config = config_builder.load().await;
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config);
-
-        // only for local testing
-        if conf.endpoint_url.is_some() {
+        // ideally we should only use endpoint_url for local testing.
+        // We may want to add a flag to disable it in prod.
+        if let Some(endpoint_url) = &conf.endpoint_url {
+            s3_config_builder = s3_config_builder.endpoint_url(endpoint_url);
             s3_config_builder = s3_config_builder.force_path_style(true);
         }
 
         let s3_config = s3_config_builder.build();
+        let s3_client = Client::from_conf(s3_config);
 
         Self {
-            client: Client::from_conf(s3_config),
+            client: s3_client,
             bucket: conf.bucket.clone(),
         }
     }
