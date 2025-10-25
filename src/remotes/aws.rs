@@ -143,7 +143,7 @@ impl S3 {
 
     async fn stream_objects<F>(&self, mut processor: F) -> Result<(), S3Error>
     where
-        F: FnMut(S3Object) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        F: AsyncFnMut(S3Object) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
         let mut continuation_token: Option<String> = None;
         let mut total_processed = 0;
@@ -179,7 +179,7 @@ impl S3 {
                             .with_timezone(&Utc),
                         };
 
-                        if let Err(e) = processor(s3_object) {
+                        if let Err(e) = processor(s3_object).await {
                             eprintln!("Error processing object: {}", e);
                         }
 
@@ -238,7 +238,7 @@ impl S3 {
         mut change_handler: F,
     ) -> Result<DiffStats, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: FnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        F: AsyncFnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     {
         let mut conn = Self::create_state_db(db_path).await?;
         let mut stats = DiffStats {
@@ -268,7 +268,7 @@ impl S3 {
         let mut mark_seen_stmt =
             tx.prepare("UPDATE object_state SET temp_seen = 1 WHERE key = ?1")?;
 
-        self.stream_objects(|current_obj| {
+        self.stream_objects(async |current_obj| {
             let previous_state = select_stmt
                 .query_row([&current_obj.key], |row| {
                     Ok(CompactS3Object {
@@ -321,7 +321,7 @@ impl S3 {
             };
 
             if let Some(change) = change {
-                change_handler(change)?;
+                change_handler(change).await?;
             }
 
             let total_processed = stats.added + stats.modified + stats.unchanged;
@@ -367,7 +367,7 @@ impl S3 {
                     .with_timezone(&Utc),
             };
 
-            change_handler(Change::Deleted(deleted_obj))?;
+            change_handler(Change::Deleted(deleted_obj)).await?;
             delete_obj_stmt.execute([&key])?;
         }
 

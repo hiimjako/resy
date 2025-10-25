@@ -66,7 +66,7 @@ async fn test_stream_diff_and_update() {
 
     // 1. Initial check: No changes
     let stats = s3
-        .stream_diff_and_update(db_path, |_| Ok(()))
+        .stream_diff_and_update(db_path, async |_| Ok(()))
         .await
         .unwrap();
     assert_eq!(stats, resy::remotes::aws::DiffStats::default());
@@ -87,7 +87,7 @@ async fn test_stream_diff_and_update() {
 
     let mut changes = Vec::new();
     let stats = s3
-        .stream_diff_and_update(db_path, |change| {
+        .stream_diff_and_update(db_path, async |change| {
             changes.push(change);
             Ok(())
         })
@@ -121,7 +121,7 @@ async fn test_stream_diff_and_update() {
 
     let mut changes = Vec::new();
     let stats = s3
-        .stream_diff_and_update(db_path, |change| {
+        .stream_diff_and_update(db_path, async |change| {
             changes.push(change);
             Ok(())
         })
@@ -152,7 +152,7 @@ async fn test_stream_diff_and_update() {
 
     let mut changes = Vec::new();
     let stats = s3
-        .stream_diff_and_update(db_path, |change| {
+        .stream_diff_and_update(db_path, async |change| {
             changes.push(change);
             Ok(())
         })
