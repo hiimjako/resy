@@ -4,8 +4,12 @@
 
 ## Usage
 
+### Basic Example
+
 ```rust
 use resy::remotes::aws::{Change, S3, S3Conf};
+// it is runtime agnostic tokio_stream or futures_util, async_stream, etc.
+use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,14 +21,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize S3 client
-    let mut s3 = S3::new(&s3_conf).await;
+    let s3 = S3::new(&s3_conf).await;
 
     // Path to store state database
     let db_path = std::path::Path::new("./bucket_state.db");
 
-    // Track changes and handle each one
-    let stats = s3.stream_diff_and_update(db_path, |change| async {
-        match change {
+    // Stream changes and handle each one
+    let mut stream = s3.stream_diff_and_update(db_path);
+
+    while let Some(result) = stream.next().await {
+        match result? {
             Change::Added(obj) => {
                 println!("➕ Added: {} ({} bytes)", obj.key, obj.size);
             }
@@ -36,15 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("❌ Deleted: {} ({} bytes)", obj.key, obj.size);
             }
         }
-        Ok(())
-    }).await?;
-
-    // Print summary
-    println!("\nSummary:");
-    println!("  Added: {}", stats.added);
-    println!("  Modified: {}", stats.modified);
-    println!("  Deleted: {}", stats.deleted);
-    println!("  Unchanged: {}", stats.unchanged);
+    }
 
     Ok(())
 }

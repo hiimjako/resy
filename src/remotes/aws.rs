@@ -1,12 +1,15 @@
+use async_stream::stream;
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::SharedCredentialsProvider;
-use aws_sdk_s3::{Client, Error as S3Error};
 use chrono::{DateTime, Utc};
+use futures_core::Stream;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::pin::Pin;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,13 +34,8 @@ pub enum Change {
     Deleted(S3Object),
 }
 
-#[derive(Debug, Default, PartialEq)]
-pub struct DiffStats {
-    pub added: u64,
-    pub modified: u64,
-    pub deleted: u64,
-    pub unchanged: u64,
-}
+pub type ChangeStream<'a> =
+    Pin<Box<dyn Stream<Item = Result<Change, Box<dyn std::error::Error + Send + Sync>>> + 'a>>;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct S3Conf {
@@ -136,69 +134,7 @@ impl S3 {
         }
     }
 
-    async fn stream_objects<F>(&self, mut processor: F) -> Result<(), S3Error>
-    where
-        F: AsyncFnMut(S3Object) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let mut continuation_token: Option<String> = None;
-        let mut total_processed = 0;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .max_keys(1000);
-
-            if let Some(token) = continuation_token.take() {
-                request = request.continuation_token(token);
-            }
-
-            let response = request.send().await?;
-
-            let contents = response.contents();
-            if !contents.is_empty() {
-                for obj in contents {
-                    if let (Some(key), Some(etag), Some(size), Some(last_modified)) =
-                        (obj.key(), obj.e_tag(), obj.size(), obj.last_modified())
-                    {
-                        let s3_object = S3Object {
-                            key: key.to_string(),
-                            etag: etag.to_string(),
-                            size,
-                            last_modified: DateTime::from_timestamp(
-                                last_modified.secs(),
-                                last_modified.subsec_nanos(),
-                            )
-                            .unwrap_or_default()
-                            .with_timezone(&Utc),
-                        };
-
-                        if let Err(e) = processor(s3_object).await {
-                            eprintln!("Error processing object: {}", e);
-                        }
-
-                        total_processed += 1;
-                    }
-                }
-            }
-
-            if total_processed % 10_000 == 0 {
-                println!("Processed {} objects", total_processed);
-            }
-
-            if response.is_truncated().unwrap_or(false) {
-                continuation_token = response.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
-            }
-        }
-
-        println!("Total processed {} objects", total_processed);
-        Ok(())
-    }
-
-    pub async fn create_state_db(db_path: &Path) -> Result<Connection, rusqlite::Error> {
+    pub fn create_state_db(db_path: &Path) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
 
         conn.execute(
@@ -227,178 +163,249 @@ impl S3 {
         Ok(conn)
     }
 
-    pub async fn stream_diff_and_update<F>(
-        &mut self,
-        db_path: &Path,
-        mut change_handler: F,
-    ) -> Result<DiffStats, Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: AsyncFnMut(Change) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let mut conn = Self::create_state_db(db_path).await?;
-        let mut stats = DiffStats {
-            added: 0,
-            modified: 0,
-            deleted: 0,
-            unchanged: 0,
-        };
+    pub fn stream_diff_and_update(&self, db_path: &Path) -> ChangeStream<'_> {
+        let db_path = db_path.to_path_buf();
+        let bucket = self.bucket.clone();
+        let client = self.client.clone();
 
-        let tx = conn.transaction()?;
-
-        tx.execute(
-            "ALTER TABLE object_state ADD COLUMN temp_seen INTEGER DEFAULT 0",
-            [],
-        )
-        .ok();
-
-        tx.execute("UPDATE object_state SET temp_seen = 0", [])?;
-
-        let mut select_stmt =
-            tx.prepare("SELECT etag, size, last_modified FROM object_state WHERE key = ?1")?;
-
-        let mut update_stmt = tx.prepare(
-            "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified, temp_seen) VALUES (?1, ?2, ?3, ?4, 1)",
-        )?;
-
-        let mut mark_seen_stmt =
-            tx.prepare("UPDATE object_state SET temp_seen = 1 WHERE key = ?1")?;
-
-        self.stream_objects(async |current_obj| {
-            let previous_state = select_stmt
-                .query_row([&current_obj.key], |row| {
-                    Ok(CompactS3Object {
-                        etag: row.get(0)?,
-                        size: row.get(1)?,
-                        last_modified: row.get(2)?,
-                    })
-                })
-                .optional()?;
-
-            let change = match previous_state {
-                None => {
-                    stats.added += 1;
-                    update_stmt.execute(params![
-                        current_obj.key,
-                        current_obj.etag,
-                        current_obj.size,
-                        current_obj.last_modified.timestamp()
-                    ])?;
-                    Some(Change::Added(current_obj.clone()))
+        Box::pin(stream! {
+            let mut conn = match Self::create_state_db(&db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
                 }
-                Some(prev_obj) => {
-                    mark_seen_stmt.execute([&current_obj.key])?;
+            };
 
-                    if prev_obj.etag != current_obj.etag {
-                        // Object modified - update it
-                        stats.modified += 1;
-                        update_stmt.execute(params![
+            let tx = match conn.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
+            };
+
+            tx.execute("ALTER TABLE object_state ADD COLUMN temp_seen INTEGER DEFAULT 0", []).ok();
+
+            // required to support SQLite versions < 3.35.0 that do not support DROP COLUMN
+            if let Err(e) = tx.execute("UPDATE object_state SET temp_seen = 0", []) {
+                yield Err(e.into());
+                return;
+            }
+
+            let mut stmt_select = match tx.prepare(
+                "SELECT etag, size, last_modified FROM object_state WHERE key = ?1"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
+            };
+
+            let mut stmt_upsert = match tx.prepare(
+                "INSERT OR REPLACE INTO object_state (key, etag, size, last_modified, temp_seen) \
+                 VALUES (?1, ?2, ?3, ?4, 1)"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
+            };
+
+            let mut stmt_mark_seen = match tx.prepare(
+                "UPDATE object_state SET temp_seen = 1 WHERE key = ?1"
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
+            };
+
+            let mut continuation_token: Option<String> = None;
+            loop {
+                let mut request = client.list_objects_v2().bucket(&bucket).max_keys(1000);
+                if let Some(token) = continuation_token.take() {
+                    request = request.continuation_token(token);
+                }
+
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
+                    }
+                };
+
+                for obj in response.contents() {
+                    let Some(current_obj) = Self::parse_aws_object(obj) else { continue };
+
+                    let previous_state = match stmt_select.query_row([&current_obj.key], |row| {
+                        Ok(CompactS3Object {
+                            etag: row.get(0)?,
+                            size: row.get(1)?,
+                            last_modified: row.get(2)?,
+                        })
+                    }).optional() {
+                        Ok(ps) => ps,
+                        Err(e) => {
+                            yield Err(e.into());
+                            return;
+                        }
+                    };
+
+                    let change = Self::determine_change(&current_obj, previous_state.clone());
+
+                    if previous_state.is_none() {
+                        if let Err(e) = stmt_upsert.execute(params![
                             current_obj.key,
                             current_obj.etag,
                             current_obj.size,
                             current_obj.last_modified.timestamp()
-                        ])?;
-                        Some(Change::Modified {
-                            old: S3Object {
-                                key: current_obj.key.clone(),
-                                etag: prev_obj.etag,
-                                size: prev_obj.size as i64,
-                                last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
-                                    .unwrap_or_default()
-                                    .with_timezone(&Utc),
-                            },
-                            new: current_obj.clone(),
-                        })
+                        ]) {
+                            yield Err(e.into());
+                            return;
+                        }
                     } else {
-                        stats.unchanged += 1;
-                        None
+                        if let Err(e) = stmt_mark_seen.execute([&current_obj.key]) {
+                            yield Err(e.into());
+                            return;
+                        }
+
+                        if change.is_some() {
+                            match stmt_upsert.execute(params![
+                                current_obj.key,
+                                current_obj.etag,
+                                current_obj.size,
+                                current_obj.last_modified.timestamp()
+                            ]) {
+                                Ok(_) => {},
+                                Err(e) => {
+                                    yield Err(e.into());
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(change) = change {
+                        yield Ok(change);
+                    }
+                }
+
+                if response.is_truncated().unwrap_or(false) {
+                    continuation_token = response.next_continuation_token().map(|s| s.to_string());
+                } else {
+                    break;
+                }
+            }
+
+            drop(stmt_select);
+            drop(stmt_upsert);
+            drop(stmt_mark_seen);
+
+            let deleted_rows: Vec<(String, CompactS3Object)> = {
+                let mut stmt = match tx.prepare(
+                    "SELECT key, etag, size, last_modified FROM object_state WHERE temp_seen = 0"
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
+                    }
+                };
+                match stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CompactS3Object {
+                            etag: row.get(1)?,
+                            size: row.get(2)?,
+                            last_modified: row.get(3)?,
+                        },
+                    ))
+                }).and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>()) {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
                     }
                 }
             };
 
-            if let Some(change) = change {
-                change_handler(change).await?;
-            }
-
-            let total_processed = stats.added + stats.modified + stats.unchanged;
-            if total_processed.is_multiple_of(10_000) {
-                println!(
-                    "Processed {}: {} added, {} modified, {} unchanged",
-                    total_processed, stats.added, stats.modified, stats.unchanged
-                );
-            }
-
-            Ok(())
-        })
-        .await?;
-
-        let mut deleted_stmt = tx.prepare(
-            "SELECT key, etag, size, last_modified FROM object_state WHERE temp_seen = 0",
-        )?;
-
-        let deleted_rows: Vec<_> = deleted_stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    CompactS3Object {
-                        etag: row.get(1)?,
-                        size: row.get(2)?,
-                        last_modified: row.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut delete_obj_stmt = tx.prepare("DELETE FROM object_state WHERE key = ?1")?;
-        for deleted_row in deleted_rows {
-            let (key, prev_obj) = deleted_row;
-            stats.deleted += 1;
-
-            let deleted_obj = S3Object {
-                key: key.clone(),
-                etag: prev_obj.etag,
-                size: prev_obj.size as i64,
-                last_modified: DateTime::from_timestamp(prev_obj.last_modified, 0)
-                    .unwrap_or_default()
-                    .with_timezone(&Utc),
+            let mut stmt_delete = match tx.prepare("DELETE FROM object_state WHERE key = ?1") {
+                Ok(s) => s,
+                Err(e) => {
+                    yield Err(e.into());
+                    return;
+                }
             };
 
-            change_handler(Change::Deleted(deleted_obj)).await?;
-            delete_obj_stmt.execute([&key])?;
+            for (key, prev_obj) in deleted_rows {
+                yield Ok(Change::Deleted(Self::compact_to_s3_object(&key, &prev_obj)));
+
+                if let Err(e) = stmt_delete.execute([&key]) {
+                    yield Err(e.into());
+                    return;
+                }
+            }
+
+            drop(stmt_delete);
+
+            // Clean up the temporary column (for next run)
+            // SQLite doesn't support DROP COLUMN before version 3.35.0
+            // so let's make sure we use version >= 3.35.0 in production
+            tx.execute(
+                "ALTER TABLE object_state DROP COLUMN IF EXISTS temp_seen",
+                [],
+            )
+            .or_else(|_| {
+                println!("Warning: Could not drop temp_seen column (older SQLite version)");
+                Ok::<_, rusqlite::Error>(0) // is it ok to return a success here, since it is
+                    // covered above.
+            })?;
+
+            if let Err(e) = tx.prepare(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_updated', ?1)"
+            ).and_then(|mut s| s.execute(params![Utc::now().timestamp()])) {
+                yield Err(e.into());
+                return;
+            }
+
+            if let Err(e) = tx.commit() {
+                yield Err(e.into());
+                return;
+            }
+        })
+    }
+
+    fn determine_change(
+        current_obj: &S3Object,
+        previous_state: Option<CompactS3Object>,
+    ) -> Option<Change> {
+        match previous_state {
+            None => Some(Change::Added(current_obj.clone())),
+            Some(prev_obj) if prev_obj.etag != current_obj.etag => Some(Change::Modified {
+                old: Self::compact_to_s3_object(&current_obj.key, &prev_obj),
+                new: current_obj.clone(),
+            }),
+            _ => None,
         }
+    }
 
-        // Clean up the temporary column (for next run)
-        // SQLite doesn't support DROP COLUMN before version 3.35.0
-        // so let's make sure we use version >= 3.35.0 in production
-        tx.execute(
-            "ALTER TABLE object_state DROP COLUMN IF EXISTS temp_seen",
-            [],
-        )
-        .or_else(|_| {
-            println!("Warning: Could not drop temp_seen column (older SQLite version)");
-            Ok::<_, rusqlite::Error>(0) // @todo: is it ok to return a success here?
-        })?;
-
-        // drop statements to release borrows on tx.
-        // It took hours to figure this out so please Tommaso let me know if there's a better way :D
-        drop(select_stmt);
-        drop(update_stmt);
-        drop(mark_seen_stmt);
-        drop(deleted_stmt);
-        drop(delete_obj_stmt);
-
-        tx.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_updated', ?1)",
-            params![Utc::now().timestamp()],
-        )?;
-
-        tx.commit()?;
-
-        println!(
-            "Diff completed: {} added, {} modified, {} deleted, {} unchanged",
-            stats.added, stats.modified, stats.deleted, stats.unchanged
-        );
-
-        Ok(stats)
+    fn parse_aws_object(obj: &aws_sdk_s3::types::Object) -> Option<S3Object> {
+        Some(S3Object {
+            key: obj.key()?.to_string(),
+            etag: obj.e_tag()?.to_string(),
+            size: obj.size()?,
+            last_modified: {
+                let lm = obj.last_modified()?;
+                DateTime::from_timestamp(lm.secs(), lm.subsec_nanos())
+                    .unwrap_or_default()
+                    .with_timezone(&Utc)
+            },
+        })
     }
 
     pub fn compact_to_s3_object(key: &str, compact: &CompactS3Object) -> S3Object {
@@ -458,16 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_stats_default() {
-        let stats = DiffStats::default();
-
-        assert_eq!(stats.added, 0);
-        assert_eq!(stats.modified, 0);
-        assert_eq!(stats.deleted, 0);
-        assert_eq!(stats.unchanged, 0);
-    }
-
-    #[test]
     fn test_change_enum_variants() {
         let obj1 = create_test_s3_object("test1", "etag1", 100, 1609459200);
         let obj2 = create_test_s3_object("test2", "etag2", 200, 1609459300);
@@ -504,7 +501,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path();
 
-        let conn = S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).unwrap();
 
         let mut stmt = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -549,7 +546,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path();
 
-        let conn = S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
@@ -577,7 +574,7 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path();
 
-        let conn = S3::create_state_db(db_path).await.unwrap();
+        let conn = S3::create_state_db(db_path).unwrap();
 
         conn.execute(
             "INSERT INTO object_state (key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",

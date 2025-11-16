@@ -7,6 +7,7 @@ use aws_sdk_s3::{
 };
 use testcontainers::{GenericImage, core::WaitFor, runners::AsyncRunner};
 use testcontainers::{ImageExt, core::ContainerPort};
+use tokio_stream::StreamExt;
 
 #[tokio::test]
 async fn test_stream_diff_and_update() {
@@ -62,14 +63,15 @@ async fn test_stream_diff_and_update() {
     let db_file = tempfile::NamedTempFile::new().unwrap();
     let db_path = db_file.path();
 
-    let mut s3 = resy::remotes::aws::S3::from_client(s3_client.clone(), bucket_name.to_string());
+    let s3 = resy::remotes::aws::S3::from_client(s3_client.clone(), bucket_name.to_string());
 
     // 1. Initial check: No changes
-    let stats = s3
-        .stream_diff_and_update(db_path, async |_| Ok(()))
-        .await
-        .unwrap();
-    assert_eq!(stats, resy::remotes::aws::DiffStats::default());
+    let mut stream = s3.stream_diff_and_update(db_path);
+    let mut changes = Vec::new();
+    while let Some(result) = stream.next().await {
+        changes.push(result.unwrap());
+    }
+    assert_eq!(changes.len(), 0);
 
     // 2. Add a file
     let key = "test-file.txt";
@@ -85,18 +87,12 @@ async fn test_stream_diff_and_update() {
         .await
         .unwrap();
 
+    let mut stream = s3.stream_diff_and_update(db_path);
     let mut changes = Vec::new();
-    let stats = s3
-        .stream_diff_and_update(db_path, async |change| {
-            changes.push(change);
-            Ok(())
-        })
-        .await
-        .unwrap();
+    while let Some(result) = stream.next().await {
+        changes.push(result.unwrap());
+    }
 
-    assert_eq!(stats.added, 1);
-    assert_eq!(stats.modified, 0);
-    assert_eq!(stats.deleted, 0);
     assert_eq!(changes.len(), 1);
     match &changes[0] {
         resy::remotes::aws::Change::Added(obj) => {
@@ -119,18 +115,12 @@ async fn test_stream_diff_and_update() {
         .await
         .unwrap();
 
+    let mut stream = s3.stream_diff_and_update(db_path);
     let mut changes = Vec::new();
-    let stats = s3
-        .stream_diff_and_update(db_path, async |change| {
-            changes.push(change);
-            Ok(())
-        })
-        .await
-        .unwrap();
+    while let Some(result) = stream.next().await {
+        changes.push(result.unwrap());
+    }
 
-    assert_eq!(stats.added, 0);
-    assert_eq!(stats.modified, 1);
-    assert_eq!(stats.deleted, 0);
     assert_eq!(changes.len(), 1);
     match &changes[0] {
         resy::remotes::aws::Change::Modified { old, new } => {
@@ -150,18 +140,12 @@ async fn test_stream_diff_and_update() {
         .await
         .unwrap();
 
+    let mut stream = s3.stream_diff_and_update(db_path);
     let mut changes = Vec::new();
-    let stats = s3
-        .stream_diff_and_update(db_path, async |change| {
-            changes.push(change);
-            Ok(())
-        })
-        .await
-        .unwrap();
+    while let Some(result) = stream.next().await {
+        changes.push(result.unwrap());
+    }
 
-    assert_eq!(stats.added, 0);
-    assert_eq!(stats.modified, 0);
-    assert_eq!(stats.deleted, 1);
     assert_eq!(changes.len(), 1);
     match &changes[0] {
         resy::remotes::aws::Change::Deleted(obj) => {
@@ -170,4 +154,45 @@ async fn test_stream_diff_and_update() {
         }
         _ => panic!("Expected Deleted change"),
     }
+}
+
+#[tokio::test]
+async fn test_stream_stops_at_first_error() {
+    let s3_client = Client::from_conf(
+        config::Builder::new()
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "test", "test", None, None, "test",
+            )))
+            .endpoint_url("http://invalid-endpoint:9999")
+            .region(Region::new("us-east-1"))
+            .behavior_version(BehaviorVersion::latest())
+            .force_path_style(true)
+            .build(),
+    );
+
+    let s3 = resy::remotes::aws::S3::from_client(s3_client, "test-bucket".to_string());
+    let db_file = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db_file.path();
+
+    let mut stream = s3.stream_diff_and_update(db_path);
+    let mut error_occurred = false;
+
+    while let Some(result) = stream.next().await {
+        if result.is_err() {
+            // should quit the stream
+            error_occurred = true;
+        }
+    }
+
+    assert!(
+        error_occurred,
+        "Should receive an error from invalid endpoint"
+    );
+
+    let remaining: Vec<_> = stream.collect().await;
+    assert_eq!(
+        remaining.len(),
+        0,
+        "Stream should stop after first error, no more items should be yielded"
+    );
 }

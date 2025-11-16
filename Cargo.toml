@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-stream = "0.3"
 aws-config = "1.8.6"
 aws-credential-types = "1.2.6"
 aws-sdk-s3 = "1.106.0"
 chrono = { version = "0.4.42", features = ["serde"] }
+futures-core = "0.3"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.223", features = ["derive"] }
@@ -15,7 +17,7 @@ tokio = { version = "1.47.1", features = ["full"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
+tokio-stream = "0.1"
 mockall = "0.13"
 tempfile = "3.0"
 aws-sdk-s3 = { version = "1.106.0", features = ["test-util"] }

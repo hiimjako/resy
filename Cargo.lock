@@ -2756,6 +2756,7 @@ checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
 name = "resy"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -2764,6 +2765,7 @@ dependencies = [
  "aws-types",
  "chrono",
  "criterion",
+ "futures-core",
  "mockall",
  "rusqlite",
  "secrecy",
@@ -2771,7 +2773,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
- "tokio-test",
+ "tokio-stream",
  "zeroize",
 ]
 
@@ -3583,19 +3585,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "xattr",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
-dependencies = [
- "async-stream",
- "bytes",
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]
